@@ -113,7 +113,10 @@ class Settings:
 
     def check_local_path(self, path: str | Path) -> Path:
         """解析本地路径并按白名单校验，防止 Agent 读写任意文件。"""
-        p = Path(path).expanduser().resolve()
+        try:
+            p = Path(path).expanduser().resolve()
+        except RuntimeError as e:  # Python 3.10–3.12 遇到符号链接循环时抛 RuntimeError
+            raise OSError(f"无法解析本地路径（可能存在符号链接循环）：{path}") from e
         if self.allowed_dirs and not any(p == d or d in p.parents for d in self.allowed_dirs):
             allowed = ", ".join(str(d) for d in self.allowed_dirs)
             raise PermissionError(f"本地路径 {p} 不在允许的目录内（BAIDUMCP_ALLOWED_DIRS={allowed}）")

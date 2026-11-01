@@ -300,3 +300,26 @@ def test_private_json_writer_ignores_planted_tmp_symlink(tmp_path):
     assert outside.read_text() == "protected"
     assert json.loads((d / "x.json").read_text()) == {"k": 1}
     assert oct((d / "x.json").stat().st_mode & 0o777) == "0o600"
+
+
+async def test_upload_dir_symlink_loop_is_isolated(tmp_path, pan, client, settings, monkeypatch):
+    src = tmp_path / "loopdir"
+    src.mkdir()
+    (src / "good.txt").write_bytes(b"good")
+    (src / "loop_a").symlink_to(src / "loop_b")
+    (src / "loop_b").symlink_to(src / "loop_a")
+
+    # 模拟 Python 3.10–3.12：resolve() 遇到符号链接循环时抛 RuntimeError
+    real_resolve = type(src).resolve
+
+    def resolve(self, strict=False):
+        if self.name.startswith("loop_"):
+            raise RuntimeError(f"Symlink loop from {self}")
+        return real_resolve(self, strict)
+
+    monkeypatch.setattr(type(src), "resolve", resolve)
+    res = await Uploader(client, settings).upload(str(src), "/l")
+    d = res.to_dict()
+    assert "/l/loopdir/good.txt" in pan.files
+    assert d["transferred"] == 1 and d["failed"] == 2
+    assert all("符号链接循环" in e["error"] for e in d["errors"])
