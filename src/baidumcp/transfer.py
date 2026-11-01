@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -107,21 +108,29 @@ class Uploader:
                 if e.errno != -9:
                     raise
 
+        result = TransferResult()
+        # (源文件, 网盘目标, 构建任务时记录的大小)；大小缓存下来，源文件中途消失也只算单个文件失败
+        jobs: list[tuple[Path, str, int]] = []
         if local.is_file():
             target = posixpath.join(remote, local.name) if as_dir else remote
-            jobs = [(local, target)]
+            jobs.append((local, target, local.stat().st_size))
         else:
             base = posixpath.join(remote, local.name)
-            jobs = [
-                (p, posixpath.join(base, *p.relative_to(local).parts))
-                for p in sorted(local.rglob("*"))
-                if p.is_file()
-            ]
+            for p in sorted(local.rglob("*")):
+                dst = posixpath.join(base, *p.relative_to(local).parts)
+                try:
+                    if p.is_symlink():
+                        # 目录内的符号链接可能指向白名单之外，按解析后的真实路径再校验一次
+                        self.settings.check_local_path(p)
+                    if not p.is_file():
+                        continue
+                    jobs.append((p, dst, p.stat().st_size))
+                except (PermissionError, OSError) as e:
+                    result.errors.append({"local": str(p), "remote": dst, "error": str(e)})
 
-        total = sum(p.stat().st_size for p, _ in jobs)
-        result = TransferResult()
+        total = sum(size for _, _, size in jobs)
         done_before = 0
-        for src, dst in jobs:
+        for src, dst, size in jobs:
             async def file_progress(done: int, _total: int, _msg: str, _src=src, _base=done_before) -> None:
                 await _emit(progress, _base + done, total, f"上传 {_src.name}")
 
@@ -130,7 +139,7 @@ class Uploader:
                 result.files.append(info)
             except Exception as e:  # noqa: BLE001 —— 单个文件失败不影响其余文件
                 result.errors.append({"local": str(src), "remote": dst, "error": str(e)})
-            done_before += src.stat().st_size
+            done_before += size
         await _emit(progress, total, total, "上传完成")
         return result
 
@@ -257,7 +266,7 @@ class Downloader:
                 dlink = dlinks.get(entry["fs_id"])
                 if not dlink:
                     raise PanError(-1, "未获取到下载链接")
-                await self._fetch(dlink, target, size, file_progress)
+                await self._fetch(dlink, target, size, file_progress, entry=entry)
                 result.files.append({"remote": entry["path"], "local": str(target), "size": size})
             except Exception as e:  # noqa: BLE001
                 result.errors.append({"remote": entry["path"], "local": str(target), "error": str(e)})
@@ -269,9 +278,12 @@ class Downloader:
     def _skip(entry: dict, target: Path, overwrite: bool) -> bool:
         return not overwrite and target.is_file() and target.stat().st_size == int(entry.get("size", -1))
 
-    async def _fetch(self, dlink: str, target: Path, size: int, progress: ProgressFn | None, retries: int = 5) -> None:
+    async def _fetch(self, dlink: str, target: Path, size: int, progress: ProgressFn | None, retries: int = 5, entry: dict | None = None) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         part = target.with_name(target.name + PART_SUFFIX)
+        meta = resume_meta_path(target)
+        identity = part_identity(entry or {"size": size})
+        self._prepare_part(part, meta, identity)
         attempt = 0
         while True:
             have = part.stat().st_size if part.exists() else 0
@@ -286,14 +298,15 @@ class Downloader:
             try:
                 async with self.client.http.stream("GET", f"{dlink}{sep}access_token={token}", headers=headers, timeout=httpx.Timeout(60, read=120)) as resp:
                     if resp.status_code == 416:
+                        # 续传偏移无效：丢弃临时文件从头下载，但计入重试次数，避免无限循环
                         part.unlink(missing_ok=True)
-                        continue
+                        raise PanError(-1, "HTTP 416 Range Not Satisfiable")
                     if resp.status_code not in (200, 206):
                         body = (await resp.aread())[:300].decode("utf-8", "replace")
                         raise PanError(-1, f"HTTP {resp.status_code} {body}")
-                    mode = "ab" if resp.status_code == 206 and have else "wb"
-                    written = have if mode == "ab" else 0
-                    with part.open(mode) as f:
+                    append = resp.status_code == 206 and have > 0
+                    written = have if append else 0
+                    with _open_nofollow(part, append) as f:
                         async for chunk in resp.aiter_bytes(1024 * 1024):
                             f.write(chunk)
                             written += len(chunk)
@@ -309,3 +322,39 @@ class Downloader:
         if actual != size:
             raise PanError(-1, f"文件大小不一致：期望 {size}，实际 {actual}（已保留 {part.name}，可重试续传）")
         os.replace(part, target)
+        meta.unlink(missing_ok=True)
+
+    def _prepare_part(self, part: Path, meta: Path, identity: dict) -> None:
+        """清理不可信的临时文件：符号链接、来源不明或对应的网盘文件已变化的部分下载。
+
+        续传记录 meta 放在 baidumcp 自己的状态目录里，不在用户目录下额外创建或删除文件。
+        """
+        if part.is_symlink():
+            part.unlink()
+        self.settings.check_local_path(part)
+        try:
+            saved = json.loads(meta.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            saved = None
+        if saved != identity:
+            part.unlink(missing_ok=True)
+            write_private_json(meta, identity)
+
+
+def resume_meta_path(target: Path) -> Path:
+    """某个下载目标对应的续传记录（按目标绝对路径哈希，存放在状态目录）。"""
+    key = hashlib.sha1(str(target).encode("utf-8")).hexdigest()
+    return state_dir() / "downloads" / f"{key}.json"
+
+
+def part_identity(entry: dict) -> dict:
+    """部分下载对应的网盘文件版本；任一字段变化都不能续传。"""
+    return {k: entry.get(k) for k in ("fs_id", "size", "md5", "server_mtime")}
+
+
+@contextlib.contextmanager
+def _open_nofollow(path: Path, append: bool):
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if append else os.O_TRUNC) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o644)
+    with os.fdopen(fd, "ab" if append else "wb") as f:
+        yield f

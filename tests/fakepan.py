@@ -46,7 +46,7 @@ class FakePan:
         return sorted(names)
 
     def transport(self) -> httpx.MockTransport:
-        return httpx.MockTransport(self.handle)
+        return httpx.MockTransport(lambda req: self.handle(req))
 
     # ---------- 路由 ----------
     def handle(self, req: httpx.Request) -> httpx.Response:
