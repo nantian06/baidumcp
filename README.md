@@ -2,6 +2,19 @@
 
 百度网盘 MCP 整合层：**一个入口**同时提供“本机 ⇄ 网盘”的上传下载，以及百度官方 MCP 的浏览、搜索、管理工具，方便各种 Agent 快速接入。
 
+## 项目介绍
+
+`baidumcp` 是一个运行在用户本机的 Python CLI 与 MCP Server，面向需要让 AI Agent 在本地文件与百度网盘之间传输文件，并调用百度官方网盘工具的场景。它把本地传输能力和官方 MCP 代理放进同一接入层，减少不同 Agent 的配置差异；百度应用凭据与授权令牌保存在本机配置目录，不必写进 Agent 的 MCP 配置。
+
+项目提供两类能力：
+
+- **本地传输**：上传/下载单个文件或目录，支持分片、秒传、断点续传和后台任务查询。
+- **官方工具代理**：通过百度官方 MCP 的 SSE 服务暴露网盘浏览、搜索和管理工具；统一模式会在建立代理连接时使用本机当前令牌。
+
+`baidumcp` 是按需启动的本地接入工具，不是云端托管服务，也不会自行定时同步或备份文件；Agent 仍会获得其已启用工具所对应的网盘权限。使用前请阅读[安全提示](#安全提示)和[逻辑设计与权限边界](docs/design.md)。
+
+文档导航： [文档索引](docs/README.md) · [逻辑设计与权限边界](docs/design.md) · [维护日志](docs/changelog.md)
+
 ```
 Agent（Claude Code / Codex / Hermes / Cursor / …）
   └─ baidumcp serve（stdio 或 streamable HTTP）
@@ -17,7 +30,7 @@ Agent（Claude Code / Codex / Hermes / Cursor / …）
 |---|---|---|
 | 本地文件上传 | 只在官方 Python stdio 模式里有 | ✅ 分片上传、秒传、断点续传，支持目录 |
 | 下载到本机 | ❌ 没有 | ✅ Range 断点续传，支持目录 |
-| 令牌过期 | SSE 地址里写死 access_token，30 天后失效要手动改配置 | ✅ 存在本地，到期前用 refresh_token 自动刷新，多进程安全 |
+| 令牌过期 | SSE 地址里写死 access_token，30 天后失效要手动改配置 | ✅ 本机保存，到期前自动刷新；在支持文件锁的平台上协调多进程刷新 |
 | 只支持 stdio / HTTP 的 Agent（如 Codex） | 接不了 SSE | ✅ 通过本地代理也能用官方工具 |
 | 配置 | 每个 Agent 格式不一样 | ✅ `baidumcp config <agent>` 直接生成 |
 
@@ -47,7 +60,7 @@ baidumcp auth
 baidumcp auth --code
 ```
 
-AppKey、SecretKey 和令牌都保存在 `~/.config/baidumcp/`（权限 600），Agent 的配置里**不需要放任何密钥**。
+AppKey、SecretKey 和令牌保存在本机配置目录（默认 `~/.config/baidumcp/`，也可由 `XDG_CONFIG_HOME` 或 `BAIDUMCP_HOME` 改写）；Unix-like 系统会尝试将敏感 JSON 权限设为 `600`。Agent 的配置里**不需要放任何密钥**。
 
 已有 access_token 也可以直接保存（没有 refresh_token 时 30 天后需要重新授权）：
 
@@ -62,7 +75,7 @@ baidumcp config --list
 baidumcp config claude-code
 ```
 
-常见 Agent 的配置如下（`baidumcp config` 会自动填入本机 `baidumcp` 的绝对路径）。
+常见 Agent 的配置如下（`baidumcp config` 优先使用 PATH 中已安装的 `baidumcp` 命令；未找到时使用当前 Python 解释器启动模块）。
 
 **Claude Code**
 
@@ -145,7 +158,7 @@ baidumcp token          # 输出当前可用的 access_token，供脚本使用
 
 ## 安全提示
 
-- 授权范围是 `basic,netdisk`，相当于整个网盘的权限。Agent 能调用 `file_del` 等官方管理工具；如需限制，可在 Agent 侧过滤工具（例如 Hermes 的 `tools.exclude`）。
+- OAuth scope 为 `basic,netdisk`；实际可访问范围还受百度开放平台应用/账号权限影响。启用官方代理后，Agent 可调用上游当前暴露的网盘管理工具（可能包括 `file_del`）；如需限制，请在 Agent 侧过滤工具。
 - 不设置 `BAIDUMCP_ALLOWED_DIRS` 时，Agent 可以上传本机任意可读文件，或写入任意可写位置。
 - `--transport http` 默认只监听 `127.0.0.1`，没有鉴权，不要暴露到公网。
 
