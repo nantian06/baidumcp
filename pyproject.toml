@@ -1,0 +1,29 @@
+[project]
+name = "baidumcp"
+version = "0.1.0"
+description = "百度网盘 MCP 整合层：本地上传/下载 + 代理官方 MCP，一个入口接入各种 Agent"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "fastmcp>=4.1,<5",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "uvicorn"]
+
+[project.scripts]
+baidumcp = "baidumcp.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/baidumcp"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
