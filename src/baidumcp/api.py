@@ -85,6 +85,13 @@ class PanClient:
                 await asyncio.sleep(2**attempt)
                 continue
             code = _errno(body)
+            if code == 0 and resp.status_code >= 400:
+                # HTTP 错误但 JSON 里没有 errno（如网关 503）：不能当成功，否则空列表会被当成空目录
+                if (resp.status_code >= 500 or resp.status_code == 429) and attempt < retries:
+                    attempt += 1
+                    await asyncio.sleep(2**attempt)
+                    continue
+                raise PanError(-resp.status_code, f"HTTP {resp.status_code} {str(body)[:200]}", body)
             if code == 0:
                 return body
             if code in TOKEN_ERRORS and not refreshed and self.tokens.can_refresh:
