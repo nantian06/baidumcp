@@ -5,8 +5,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -41,17 +43,22 @@ def state_dir() -> Path:
 
 
 def write_private_json(path: Path, data: dict) -> None:
-    """原子写入并把权限设为 600（含密钥/令牌）。"""
+    """原子写入并把权限设为 600（含密钥/令牌）。
+
+    临时文件用 mkstemp 生成（随机文件名 + O_EXCL），不会跟随预先放好的符号链接。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    with contextlib.suppress(OSError):
         os.chmod(path, 0o600)
-    except OSError:
-        pass
 
 
 def read_json(path: Path) -> dict:

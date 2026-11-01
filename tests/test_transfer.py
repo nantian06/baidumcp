@@ -9,7 +9,8 @@ from baidumcp.api import PanClient
 from baidumcp.auth import Token, TokenStore
 from baidumcp.config import Settings, state_dir, token_path
 from baidumcp.api import PanError
-from baidumcp.transfer import Downloader, Uploader, part_identity
+from baidumcp.config import write_private_json
+from baidumcp.transfer import Downloader, Uploader, part_identity, resume_meta_path
 
 from fakepan import FakePan
 
@@ -112,7 +113,7 @@ async def test_download_resume_with_range(tmp_path, pan, client, settings):
     target = tmp_path / "m.mkv"
     (tmp_path / "m.mkv.baidumcp.part").write_bytes(data[:4000])
     entry = pan._entry("/movies/m.mkv")
-    (tmp_path / "m.mkv.baidumcp.part.json").write_text(json.dumps(part_identity(entry)))
+    write_private_json(resume_meta_path(target.resolve()), part_identity(entry))
     res = await Downloader(client, settings).download("/movies/m.mkv", str(target))
     assert res.to_dict()["ok"], res.errors
     assert target.read_bytes() == data
@@ -213,7 +214,7 @@ async def test_download_part_symlink_not_followed(tmp_path, pan, client, setting
     work = tmp_path / "work"
     work.mkdir()
     (work / "f.bin.baidumcp.part").symlink_to(outside)
-    (work / "f.bin.baidumcp.part.json").write_text(json.dumps(part_identity(pan._entry("/f.bin"))))
+    write_private_json(resume_meta_path((work / "f.bin").resolve()), part_identity(pan._entry("/f.bin")))
     res = await Downloader(client, settings).download("/f.bin", str(work / "f.bin"))
     assert res.to_dict()["ok"], res.errors
     assert outside.read_bytes() == b"protected"
@@ -225,12 +226,12 @@ async def test_download_discards_stale_partial(tmp_path, pan, client, settings):
     pan.put("/doc.bin", new)
     (tmp_path / "doc.bin.baidumcp.part").write_bytes(old[:2000])
     stale = part_identity({**pan._entry("/doc.bin"), "fs_id": 1})  # 旧版本文件
-    (tmp_path / "doc.bin.baidumcp.part.json").write_text(json.dumps(stale))
+    write_private_json(resume_meta_path((tmp_path / "doc.bin").resolve()), stale)
     res = await Downloader(client, settings).download("/doc.bin", str(tmp_path / "doc.bin"))
     assert res.to_dict()["ok"], res.errors
     assert (tmp_path / "doc.bin").read_bytes() == new
     assert pan.range_requests == []
-    assert not (tmp_path / "doc.bin.baidumcp.part.json").exists()
+    assert not resume_meta_path((tmp_path / "doc.bin").resolve()).exists()
 
 
 async def test_download_partial_without_metadata_restarts(tmp_path, pan, client, settings):
@@ -274,3 +275,28 @@ async def test_http_error_without_errno_is_not_success(tmp_path, pan, client, se
     with pytest.raises(PanError, match="503"):
         await Downloader(client, settings).download("/dir", str(tmp_path))
     assert len(calls) == 4  # 1 次 + 3 次重试
+
+
+async def test_download_leaves_unrelated_user_files_alone(tmp_path, pan, client, settings):
+    pan.put("/a", b"remote-a")
+    work = tmp_path / "work"
+    work.mkdir()
+    user_file = work / "a.baidumcp.part.json"
+    user_file.write_text("my own notes")
+    res = await Downloader(client, settings).download("/a", str(work / "a"))
+    assert res.to_dict()["ok"], res.errors
+    assert user_file.read_text() == "my own notes"
+    assert sorted(p.name for p in work.iterdir()) == ["a", "a.baidumcp.part.json"]
+
+
+def test_private_json_writer_ignores_planted_tmp_symlink(tmp_path):
+    outside = tmp_path / "outside.txt"
+    outside.write_text("protected")
+    d = tmp_path / "d"
+    d.mkdir()
+    for name in ("x.json.tmp", ".x.json.tmp"):
+        (d / name).symlink_to(outside)
+    write_private_json(d / "x.json", {"k": 1})
+    assert outside.read_text() == "protected"
+    assert json.loads((d / "x.json").read_text()) == {"k": 1}
+    assert oct((d / "x.json").stat().st_mode & 0o777) == "0o600"

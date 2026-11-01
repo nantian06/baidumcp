@@ -209,7 +209,6 @@ class Uploader:
 # ======================= 下载 =======================
 
 PART_SUFFIX = ".baidumcp.part"
-PART_META_SUFFIX = ".baidumcp.part.json"
 
 
 class Downloader:
@@ -282,7 +281,7 @@ class Downloader:
     async def _fetch(self, dlink: str, target: Path, size: int, progress: ProgressFn | None, retries: int = 5, entry: dict | None = None) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         part = target.with_name(target.name + PART_SUFFIX)
-        meta = target.with_name(target.name + PART_META_SUFFIX)
+        meta = resume_meta_path(target)
         identity = part_identity(entry or {"size": size})
         self._prepare_part(part, meta, identity)
         attempt = 0
@@ -326,11 +325,13 @@ class Downloader:
         meta.unlink(missing_ok=True)
 
     def _prepare_part(self, part: Path, meta: Path, identity: dict) -> None:
-        """清理不可信的临时文件：符号链接、来源不明或对应的网盘文件已变化的部分下载。"""
-        for p in (part, meta):
-            if p.is_symlink():
-                p.unlink()
-            self.settings.check_local_path(p)
+        """清理不可信的临时文件：符号链接、来源不明或对应的网盘文件已变化的部分下载。
+
+        续传记录 meta 放在 baidumcp 自己的状态目录里，不在用户目录下额外创建或删除文件。
+        """
+        if part.is_symlink():
+            part.unlink()
+        self.settings.check_local_path(part)
         try:
             saved = json.loads(meta.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError):
@@ -338,6 +339,12 @@ class Downloader:
         if saved != identity:
             part.unlink(missing_ok=True)
             write_private_json(meta, identity)
+
+
+def resume_meta_path(target: Path) -> Path:
+    """某个下载目标对应的续传记录（按目标绝对路径哈希，存放在状态目录）。"""
+    key = hashlib.sha1(str(target).encode("utf-8")).hexdigest()
+    return state_dir() / "downloads" / f"{key}.json"
 
 
 def part_identity(entry: dict) -> dict:
